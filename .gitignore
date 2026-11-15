@@ -1,8 +1,8 @@
 target/
 *.pkg.tar.zst
-src/
-pkg/
-tuxedo-drivers/
+/kernel/src/
+/kernel/pkg/
+/kernel/tuxedo-drivers/
 *.o
 *.ko
 *.mod*
