@@ -1,12 +1,15 @@
-diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
---- a/src/clevo_acpi.c	2026-10-06 19:40:55.000000000 +0500
-+++ b/src/clevo_acpi.c	2026-11-15 02:47:12.737628611 +0500
-@@ -23,11 +23,15 @@
+diff --git a/src/clevo_acpi.c b/src/clevo_acpi.c
+index 4365977..c04a4f4 100644
+--- a/src/clevo_acpi.c
++++ b/src/clevo_acpi.c
+@@ -23,11 +23,37 @@
  #include <linux/module.h>
  #include <linux/platform_device.h>
  #include <linux/acpi.h>
 +#include <linux/delay.h>
++#include <linux/dmi.h>
 +#include <linux/mutex.h>
++#include <linux/string.h>
  #include <linux/version.h>
  #include "clevo_interfaces.h"
  
@@ -14,27 +17,58 @@ diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
  
 +static DEFINE_MUTEX(clevo_acpi_ec_lock);
 +
++static bool clevo_acpi_is_gigabyte_u4(void)
++{
++	const char *vendor = dmi_get_system_info(DMI_SYS_VENDOR);
++	const char *product = dmi_get_system_info(DMI_PRODUCT_NAME);
++	const char *board = dmi_get_system_info(DMI_BOARD_NAME);
++
++	if (!vendor || !strstr(vendor, "GIGABYTE"))
++		return false;
++
++	if (product && strstr(product, "RC14UD"))
++		return true;
++
++	if (board && (strcmp(board, "U4") == 0 ||
++		      strncmp(board, "U4 ", 3) == 0 ||
++		      strstr(board, "L14xMU") != NULL))
++		return true;
++
++	return false;
++}
++
  struct clevo_platform_driver_data_t {
  	struct acpi_device *adev;
  	struct clevo_interface_t *clevo_interface;
-@@ -44,11 +48,13 @@
+@@ -44,7 +70,8 @@ static int clevo_acpi_evaluate(struct acpi_device *device, u8 cmd, u32 arg, unio
  	union acpi_object *out_obj;
  	guid_t clevo_acpi_dsm_uuid;
  
 -	// Integer package data for argument
 +	u32 arg_val = arg;
-+	// Buffer package data for argument (required by DSDT CreateField)
++	// Integer package data for argument (default upstream Clevo behavior)
  	union acpi_object dsm_argv4_package_data[] = {
  		{
--			.integer.type = ACPI_TYPE_INTEGER,
--			.integer.value = arg
-+			.buffer.type = ACPI_TYPE_BUFFER,
-+			.buffer.length = sizeof(arg_val),
-+			.buffer.pointer = (u8 *)&arg_val
- 		}
+ 			.integer.type = ACPI_TYPE_INTEGER,
+@@ -59,6 +86,17 @@ static int clevo_acpi_evaluate(struct acpi_device *device, u8 cmd, u32 arg, unio
+ 		.package.elements = dsm_argv4_package_data
  	};
  
-@@ -132,14 +138,23 @@
++	if (clevo_acpi_is_gigabyte_u4()) {
++		// DSDT on GIGABYTE U4 / RC14UD uses CreateField on Arg3[0], requiring a 4-byte buffer
++		dsm_argv4_package_data[0] = (union acpi_object) {
++			.buffer = {
++				.type = ACPI_TYPE_BUFFER,
++				.length = sizeof(arg_val),
++				.pointer = (u8 *)&arg_val,
++			},
++		};
++	}
++
+ 	status = guid_parse(CLEVO_ACPI_DSM_UUID, &clevo_acpi_dsm_uuid);
+ 	if (status < 0)
+ 		return -ENOENT;
+@@ -132,14 +170,22 @@ static int clevo_acpi_interface_method_call(u8 cmd, u32 arg, union acpi_object *
  {
  	int status = 0;
  
@@ -42,12 +76,11 @@ diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
  	if (!IS_ERR_OR_NULL(active_driver_data)) {
  		status = clevo_acpi_evaluate(active_driver_data->adev, cmd, arg, result_value);
 +		/*
-+		 * Hold the lock for 120ms after EC mailbox write commands (0x41, 0x76, 0x79)
-+		 * so background pollers like tccd (calling 0x63/0x64 FCMD=0xC0) cannot overwrite
-+		 * FDAT/FBUF/FBF1/FCMD before the ITE IT5570E EC processes the command.
-+		 * Note: ACPI evaluation and AML PATM mutex are already released before msleep().
++		 * On GIGABYTE U4 / IT5570E EC, hold the lock 120ms after EC mailbox writes
++		 * (after AML PATM mutex has already been released) so tccd polling cannot
++		 * overwrite FDAT/FBUF/FBF1/FCMD mid-transaction.
 +		 */
-+		if (cmd == 0x41 || cmd == 0x76 || cmd == 0x79)
++		if (clevo_acpi_is_gigabyte_u4() && (cmd == 0x41 || cmd == 0x76 || cmd == 0x79))
 +			msleep(120);
  	} else {
  		pr_err("acpi method call exec, no driver data found\n");
@@ -59,7 +92,7 @@ diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
  
  	return status;
  }
-@@ -148,6 +163,7 @@
+@@ -148,6 +194,7 @@ static int clevo_acpi_interface_method_call_pkgbuf(u8 cmd, u8 *arg, u32 length,
  {
  	int status = 0;
  
@@ -67,7 +100,7 @@ diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
  	if (!IS_ERR_OR_NULL(active_driver_data)) {
  		status = clevo_acpi_evaluate_pkgbuf(active_driver_data->adev, cmd, arg, length, result_value);
  	} else {
-@@ -155,6 +171,7 @@
+@@ -155,6 +202,7 @@ static int clevo_acpi_interface_method_call_pkgbuf(u8 cmd, u8 *arg, u32 length,
  		pr_err("..for method_call: %0#2x\n", cmd);
  		status = -ENODATA;
  	}
@@ -75,28 +108,37 @@ diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
  
  	return status;
  }
-diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
---- a/src/clevo_keyboard.h	2026-10-06 19:40:55.000000000 +0500
-+++ b/src/clevo_keyboard.h	2026-11-15 02:47:07.837789218 +0500
-@@ -22,6 +22,8 @@
+diff --git a/src/clevo_keyboard.h b/src/clevo_keyboard.h
+index 7b3453c..6361634 100644
+--- a/src/clevo_keyboard.h
++++ b/src/clevo_keyboard.h
+@@ -22,6 +22,9 @@
  #define CLEVO_KEYBOARD_H
  
  #include <linux/power_supply.h>
 +#include <linux/delay.h>
 +#include <linux/mutex.h>
++#include <linux/string.h>
  #include <acpi/battery.h>
  #include <linux/version.h>
  
-@@ -458,11 +460,26 @@
+@@ -458,11 +461,33 @@ static ssize_t clevo_fn_lock_store(struct device *dev,
  	return size;
  }
  
++static bool clevo_is_u4_board_name(const char *board)
++{
++	return board != NULL &&
++	       (strcmp(board, "U4") == 0 ||
++		strncmp(board, "U4 ", 3) == 0 ||
++		strstr(board, "L14xMU") != NULL);
++}
++
 +static bool clevo_uses_atomic_baee_fc(void)
 +{
-+	return (dmi_string_in(DMI_SYS_VENDOR, "GIGABYTE") &&
-+		(dmi_string_in(DMI_PRODUCT_NAME, "RC14UD") ||
-+		 dmi_string_in(DMI_BOARD_NAME, "U4"))) ||
-+	       dmi_string_in(DMI_BOARD_NAME, "L14xMU");
++	return dmi_string_in(DMI_SYS_VENDOR, "GIGABYTE") &&
++	       (dmi_string_in(DMI_PRODUCT_NAME, "RC14UD") ||
++		clevo_is_u4_board_name(dmi_get_system_info(DMI_BOARD_NAME)));
 +}
 +
  static bool clevo_fn_lock_available(void){
@@ -105,8 +147,8 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  	u8 fnlock;
  
 +	/*
-+	 * DSDT _DSM Arg2 == 0x04 (PEVT) on RC14UD/L14xMU returns without Release(PATM)
-+	 * on unsupported subcommands like 0x18 and 0x1E.
++	 * DSDT _DSM Arg2 == 0x04 (PEVT) on GIGABYTE U4 / RC14UD returns without
++	 * Release(PATM) on unsupported subcommands like 0x18 and 0x1E.
 +	 */
 +	if (clevo_uses_atomic_baee_fc())
 +		return 0;
@@ -114,17 +156,9 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  	// no sysfs device for Aura Gen3 due to Fn Lock interference (via keyboard)
  	// but Aura Gen3 refresh (NL45AU2 und NL57AU) has working Fn Lock
  	if ((dmi_match(DMI_PRODUCT_SKU, "AURA14GEN3") ||
-@@ -536,7 +553,6 @@
- 	// Known exclude list
- 	bool excluded_device = false
- 		|| dmi_string_in(DMI_BOARD_NAME, "N24_25BU")
--		|| dmi_string_in(DMI_BOARD_NAME, "L14xMU")
- 		|| dmi_string_in(DMI_BOARD_NAME, "N141CU")
- 		|| dmi_string_in(DMI_BOARD_NAME, "NH5xAx")
- 		|| dmi_string_in(DMI_BOARD_NAME, "NL5xNU")
-@@ -553,6 +569,16 @@
- 		return 0;
- 	}
+@@ -533,6 +558,16 @@ static int clevo_has_legacy_flexicharger(bool *status)
+ 	u32 write_data = 0x06000000;
+ 	int result;
  
 +	if (clevo_uses_atomic_baee_fc()) {
 +		result = clevo_evaluate_method(0x77, 0, &read_data);
@@ -136,10 +170,10 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
 +		return 0;
 +	}
 +
- 	// Use a combination of read and write read values to identify legacy flexicharger
- 	// Using set command should read the command back as result if existing
- 	result = clevo_evaluate_method(0x77, 0, &read_data);
-@@ -570,23 +596,76 @@
+ 	// Known exclude list
+ 	bool excluded_device = false
+ 		|| dmi_string_in(DMI_BOARD_NAME, "N24_25BU")
+@@ -570,6 +605,49 @@ static int clevo_has_legacy_flexicharger(bool *status)
  	return result;
  }
  
@@ -160,7 +194,7 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
 +
 +	/*
 +	 * Method 0x77 returns static boot-time BIOS NVRAM (CONV: BAEE, BSCP, BTCP);
-+	 * DSDT does not update NVRAM on ZEVT(0x41, ...0xCB), so keep shadow state.
++	 * DSDT does not update NVRAM on ZEVT(0x41, ...0xCB), so maintain shadow state.
 +	 */
 +	result = clevo_evaluate_method(0x77, 0, &data);
 +	if (result != 0)
@@ -188,19 +222,8 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
 +
  /**
   * Read legacy flexicharger data. If successful parameter contains result.
-- * 
-+ *
-  * @param start Start threshold
-  * @param end End threshold
-  * @param status On or Off (1 or 0)
-  */
- static int clevo_legacy_flexicharger_read(u8 *start, u8 *end, u8 *status)
- {
--	/*
--	 * Data bytes
--	 *            end      start    on/off
--	 * |--------|--------|--------|--------|
--	 */
+  * 
+@@ -587,6 +665,21 @@ static int clevo_legacy_flexicharger_read(u8 *start, u8 *end, u8 *status)
  	u32 data;
  	int result;
  
@@ -222,13 +245,7 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  	result = clevo_evaluate_method(0x77, 0, &data);
  	if (end != NULL)
  		*end = (data >> 0x10) & 0xff;
-@@ -600,12 +679,15 @@
- 
- /**
-  * Write flexicharger data.
-- * 
-+ *
-  * @param start Start threshold
+@@ -605,7 +698,10 @@ static int clevo_legacy_flexicharger_read(u8 *start, u8 *end, u8 *status)
   * @param end End threshold
   * @param status On or Off (1 or 0)
   */
@@ -240,46 +257,48 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  {
  	// Two different subcommands for writing
  	u32 write_data_thresholds = (0x06 << 0x18);
-@@ -613,29 +695,96 @@
+@@ -613,29 +709,99 @@ static int clevo_legacy_flexicharger_write(const u8 *param_start, const u8 *para
  
  	u8 previous_start, previous_end, previous_status;
  	u8 set_start, set_end, set_status;
-+	int i;
++	size_t i;
  
 -	if (clevo_legacy_flexicharger_read(&previous_start, &previous_end, &previous_status) != 0)
 -		return -EIO;
 +	if (!clevo_uses_atomic_baee_fc()) {
 +		if (clevo_legacy_flexicharger_read(&previous_start, &previous_end, &previous_status) != 0)
 +			return -EIO;
-+
-+		set_start = param_start != NULL ? *param_start : previous_start;
-+		set_end = param_end != NULL ? *param_end : previous_end;
-+		set_status = param_status != NULL ? *param_status : previous_status;
-+
-+		write_data_thresholds |= set_start;
-+		write_data_thresholds |= (set_end << 0x08);
-+		write_data_status |= set_status & 0x01;
  
 -	// Set choosen parameters, leave nulled ones with previous value
 -	set_start = param_start != NULL ? *param_start : previous_start;
 -	set_end = param_end != NULL ? *param_end : previous_end;
 -	set_status = param_status != NULL ? *param_status : previous_status;
-+		if (clevo_evaluate_method(0x76, write_data_thresholds, NULL) != 0)
-+			return -EIO;
++		// Set choosen parameters, leave nulled ones with previous value
++		set_start = param_start != NULL ? *param_start : previous_start;
++		set_end = param_end != NULL ? *param_end : previous_end;
++		set_status = param_status != NULL ? *param_status : previous_status;
  
 -	write_data_thresholds |= set_start;
 -	write_data_thresholds |= (set_end << 0x08);
 -	write_data_status |= set_status & 0x01;
-+		if (clevo_evaluate_method(0x76, write_data_status, NULL) != 0)
-+			return -EIO;
++		write_data_thresholds |= set_start;
++		write_data_thresholds |= (set_end << 0x08);
++		write_data_status |= set_status & 0x01;
  
 -	// Write to EC, note that status go last as it also triggers save
 -	if (clevo_evaluate_method(0x76, write_data_thresholds, NULL) != 0)
 -		return -EIO;
-+		return 0;
-+	}
++		// Write to EC, note that status go last as it also triggers save
++		if (clevo_evaluate_method(0x76, write_data_thresholds, NULL) != 0)
++			return -EIO;
++
++		if (clevo_evaluate_method(0x76, write_data_status, NULL) != 0)
++			return -EIO;
  
 -	if (clevo_evaluate_method(0x76, write_data_status, NULL) != 0)
++		return 0;
++	}
++
 +	mutex_lock(&clevo_legacy_fc_lock);
 +	if (clevo_legacy_flexicharger_ensure_init_locked() != 0) {
 +		mutex_unlock(&clevo_legacy_fc_lock);
@@ -291,7 +310,7 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
 +	set_end = param_end != NULL ? *param_end : clevo_legacy_fc_end;
 +	set_status = param_status != NULL ? *param_status : clevo_legacy_fc_status;
 +
-+	/* Maintain start < end invariant regardless of sysfs attribute write order */
++	/* Maintain start < end invariant regardless of sysfs write order */
 +	if (param_end != NULL && set_start >= set_end) {
 +		set_start = clevo_legacy_flexicharger_start_values[0];
 +		for (i = 0; i < ARRAY_SIZE(clevo_legacy_flexicharger_start_values); ++i) {
@@ -299,10 +318,11 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
 +				set_start = clevo_legacy_flexicharger_start_values[i];
 +		}
 +	} else if (param_start != NULL && set_start >= set_end) {
++		ssize_t j;
 +		set_end = clevo_legacy_flexicharger_end_values[ARRAY_SIZE(clevo_legacy_flexicharger_end_values) - 1];
-+		for (i = ARRAY_SIZE(clevo_legacy_flexicharger_end_values) - 1; i >= 0; --i) {
-+			if (clevo_legacy_flexicharger_end_values[i] > set_start)
-+				set_end = clevo_legacy_flexicharger_end_values[i];
++		for (j = ARRAY_SIZE(clevo_legacy_flexicharger_end_values) - 1; j >= 0; --j) {
++			if (clevo_legacy_flexicharger_end_values[j] > set_start)
++				set_end = clevo_legacy_flexicharger_end_values[j];
 +		}
 +	}
 +
@@ -351,7 +371,7 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  static int clevo_cc4_flexicharger_read(u8 *start, u8 *end, u8 *status)
  {
  	int result;
-@@ -671,6 +820,11 @@
+@@ -671,6 +837,11 @@ static int clevo_cc4_flexicharger_read(u8 *start, u8 *end, u8 *status)
  
  static int clevo_has_cc4_flexicharger(bool *status)
  {
@@ -363,7 +383,7 @@ diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
  	if (clevo_cc4_flexicharger_read(NULL, NULL, NULL))
  		*status = false;
  	else
-@@ -1050,6 +1204,9 @@
+@@ -1050,6 +1221,9 @@ static int clevo_keyboard_resume(struct platform_device *dev)
  	clevo_leds_restore_state_extern(); // Sometimes clevo devices forget their last state after
  					   // suspend, so let the kernel ensure it.
  	clevo_leds_resume(dev);

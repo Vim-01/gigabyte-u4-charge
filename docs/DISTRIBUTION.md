@@ -1,42 +1,33 @@
-# Куда и как распространять решение (Distribution & Upstream Plan)
+# Куда и как распространять решение (Distribution Plan)
 
-Ниже разобраны реальные площадки и репозитории, где владельцы Gigabyte U4 UD (`RC14UD`) и Clevo `L14xMU` ищут решение проблемы с ограничением заряда, а также точный план публикации.
-
----
-
-## 1. Стоит ли делать отдельный репозиторий?
-
-**Да — однозначно стоит.** Причины:
-1. Апстрим `tuxedo-drivers` (GitLab) принимает **только минимальный патч ядра** — без Rust-демона `u4-charge`, без systemd-юнитов, без KDE-уведомлений и без Arch `PKGBUILD`.
-2. Самый популярный драйвер для ноутбуков Gigabyte на Linux — `tangalbert919/gigabyte-laptop-wmi` — **официально не поддерживает всю U-серию** (включая Gigabyte U4), так как U4 собран на платформе Clevo (`L14xMU` / EC IT5570E), а не на WMI `WMBC`/`WMBD`. Пользователи упираются в тупик.
-3. Отдельный репозиторий (например, **`gigabyte-u4-charge`**) даёт готовое решение «из коробки» (DKMS-патч + безопасный Rust-демон + KDE-интеграция + инструкция) и служит точкой ссылки для issues/MR в апстрим.
+Ниже зафиксирована проверенная стратегия публикации решения для владельцев GIGABYTE U4 UD (`RC14UD` / `U4` / Clevo `L14xMU`, EC `7.7` на базе ITE IT5570E).
 
 ---
 
-## 2. Каналы распространения (от приоритетного к дополнительному)
+## 1. Почему отдельный репозиторий (`Vim-01/gigabyte-u4-charge`) — основа
 
-### Канал 1: Собственный GitHub-репозиторий (`gigabyte-u4-charge`)
-- **Что публиковать:** содержимое подготовленного каталога `gigabyte-u4-charge/` (`README.md`, `README.ru.md`, `docs/HARDWARE_NOTES.md`, `kernel/`, `daemon/`, `systemd/`, `install.sh`, `LICENSE`).
-- **Важно:** предварительно проверь, что `kernel/PKGBUILD` смотрит на официальный апстрим `git+https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers.git#tag=v${pkgver}`, а не на локальный путь.
+1. **Самостоятельный пакет «из коробки»:** объединяет ядровой DKMS-патч (`clevo-drivers-u4-dkms`), безопасный пользовательский демон и CLI `u4-charge` (Rust без `unsafe`), systemd-юниты (`u4-charge.service`, `u4-charge-notify.service`) и документацию на EN/RU.
+2. **Нейтральная база для ссылок:** в сторонних проектах лучше ссылаться на конкретный технический патч и проверенные замеры в этом репозитории, а не оставлять «маркетинговые» комментарии без контекста.
 
-### Канал 2: Апстрим `tuxedo-drivers` на GitLab (главная цель для ядра!)
-- **Куда:** [https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers](https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers)
-  *(GitHub-репозиторий `tuxedocomputers/tuxedo-drivers` — только read-only зеркало; Merge Requests и Issues нужно подавать именно на GitLab).*
-- **Что отправлять:** **только минимальный патч** [`kernel/upstream-tuxedo-drivers-l14xmu.patch`](../kernel/upstream-tuxedo-drivers-l14xmu.patch) без `ec_live_state` и с DMI-ограничением `_DSM(0x04)` строго на `clevo_uses_atomic_baee_fc()`, чтобы не затронуть другие ноутбуки Clevo/TUXEDO, плюс выжимку из `docs/HARDWARE_NOTES.md` (эмпирические замеры `0x41` vs `0x76` и latch-эффект).
+---
 
-### Канал 3: Форк для Arch/Clevo — `nick42d/clevo-drivers` (GitHub) и AUR
-- **Куда:** [https://github.com/nick42d/clevo-drivers](https://github.com/nick42d/clevo-drivers) (апстрим для AUR-пакета `clevo-drivers-dkms-git`).
-- **Что делать:** открыть Issue / Pull Request со ссылкой на минимальный патч и описанием проблемы `L14xMU` / Gigabyte U4 UD. Если мейнтейнер примет патч или предложит отдельный пакет, пользователи Arch смогут обновляться прямо из AUR.
-- **Опционально — AUR:** после тестирования на вашей системе можно опубликовать в AUR пакет `clevo-drivers-u4-dkms` (или `u4-charge`), сославшись на ваш GitHub-репозиторий.
+## 2. Релевантные каналы (после согласования с пользователем)
 
-### Канал 4: `linrunner/TLP` (GitHub, Issue #803)
-- **Куда:** [https://github.com/linrunner/TLP](https://github.com/linrunner/TLP) (тема поддержки порогов Clevo/TUXEDO, Issue #803).
-- **Зачем:** TLP 1.9+ работает поверх `clevo_acpi` (`charge_control_*_threshold`), но пользователи Clevo `L14xMU` и Gigabyte U4 сталкиваются с тем, что непатченный `clevo_acpi` либо скрывает интерфейс, либо использует `0x76` / защёлкивается при повышении порога. Короткий комментарий со ссылкой на MR/репозиторий сэкономит время разработчикам TLP и пользователям `tlp-stat -b`.
+### Канал 1: Собственный GitHub-репозиторий (`Vim-01/gigabyte-u4-charge`)
+- **Статус:** опубликован (`main`).
+- **Что содержит:** `README.md`, `README.ru.md`, `docs/HARDWARE_NOTES.md`, минимальный DMI-ограниченный патч [`kernel/upstream-tuxedo-drivers-l14xmu.patch`](../kernel/upstream-tuxedo-drivers-l14xmu.patch), `kernel/PKGBUILD`, `daemon/`, `systemd/`, `install.sh`.
 
-### Канал 5: Профильные проекты и сообщества (чтобы люди реально находили)
-1. **`tangalbert919/gigabyte-laptop-wmi`** (GitHub Issues/Discussions) — вежливо предложить добавить в README рядом с пометкой *"All U series models (not supported)"* ссылку на решение для Clevo-ODM U4.
-2. **GNOME `maniacx/Battery-Health-Charging` / KDE сообщества:** упомянуть совместимость со стандартным `BAT0/charge_control_*` и KDE PowerDevil 6 после патча `clevo_acpi`.
-3. **ArchWiki:** разделы по ноутбукам Gigabyte / Clevo / `Laptop/Power management` (краткая заметка + ссылка только после стабилизации и принятия MR/AUR по правилам ArchWiki).
-4. **Статьи / посты:**
-   - **Reddit:** `r/linuxhardware`, `r/archlinux`, `r/gigabytegaming` — пост в формате *"Fixing hardware battery charge thresholds on Gigabyte U4 / Clevo L14xMU (ITE IT5570E EC)"*.
-   - **Habr (RU):** отличная техническая статья про реверс-инжиниринг DSDT + EC ITE IT5570E, бит `FBF1=0x02` в `ZEVT(0x41)` и безопасный демон на Rust без `unsafe`.
+### Канал 2: Форк для Clevo / Arch — `nick42d/clevo-drivers` (GitHub RFC Issue)
+- **Куда:** [https://github.com/nick42d/clevo-drivers/issues/new](https://github.com/nick42d/clevo-drivers/issues/new) (апстрим AUR-пакета `clevo-drivers-dkms-git`).
+- **Формат:** **RFC Issue / технический отчёт**, а не слепой Pull Request с 300+ строками C-кода. Причина: `nick42d/clevo-drivers` — это автоматизированный AUR-пайплайн (`just update-to-upstream` + `just push-to-aur`), который копирует только `PKGBUILD`, `.SRCINFO`, `dkms.conf` и минимальный `patch.diff` (сейчас — 18 строк для отключения `tuxedo_compatibility_check`).
+- **Что приложить (Option A):** ссылку на минимальный, строго ограниченный по DMI (`DMI_SYS_VENDOR=GIGABYTE` + `RC14UD`/`U4`/`L14xMU`) патч [`kernel/upstream-tuxedo-drivers-l14xmu.patch`](../kernel/upstream-tuxedo-drivers-l14xmu.patch), чтобы не затронуть другие модели Clevo/System76/Schenker, плюс вопрос мейнтейнеру: готов ли он принять второй патч в `PKGBUILD` или предпочитает отдельный пакет.
+- **Опционально — AUR:** при желании позже можно опубликовать отдельный пакет `clevo-drivers-u4-dkms` / `u4-charge` в AUR.
+
+---
+
+## 3. Каналы, которые осознанно пропускаются (чтобы избежать оффтопа и лишних отказов)
+
+1. **TUXEDO Computers GitLab (`tuxedo-drivers`) / support mail:** апстрим TUXEDO официально не поддерживает ноутбуки сторонних производителей (включая GIGABYTE) и требует аккаунт GitLab.
+2. **`linrunner/TLP` (#803):** TLP 1.9+ не содержит кода протокола `clevo_acpi` — он автоматически работает поверх стандартного `/sys/class/power_supply/BAT0/charge_control_*_threshold`, как только его экспортирует ядерный драйвер. Писать туда без апстрим-коммита ядра не имеет смысла и выглядит как оффтоп/самореклама.
+3. **`tangalbert919/gigabyte-laptop-wmi`:** автор явно отметил U-серию как неподдерживаемую (у U4 архитектура Clevo ODM, а не WMI `WMBC`/`WMBD`). Открывать там Issue со ссылкой на сторонний репозиторий также выглядит как нежелательная реклама.
+4. **Сторонние форумы / соцсети (Reddit, Discord, Habr и др.):** не используются по решению автора.
