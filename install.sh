@@ -38,9 +38,11 @@ if systemctl is-active --quiet u4-charge.service; then
     systemctl stop u4-charge.service
 fi
 
-TCCD_WAS_ACTIVE=0
+TCCD_SHOULD_START=0
+if systemctl is-active --quiet tccd.service || systemctl is-enabled --quiet tccd.service 2>/dev/null; then
+    TCCD_SHOULD_START=1
+fi
 if systemctl is-active --quiet tccd.service; then
-    TCCD_WAS_ACTIVE=1
     systemctl stop tccd.service
 fi
 
@@ -68,8 +70,9 @@ if [[ -d /sys/module/tuxedo_keyboard ]]; then
 fi
 
 echo "==> 4. Installing ${PKG_FILE##*/}..."
+installed_pkgs=$'\n'"$(pacman -Qq)"$'\n'
 for conflict_pkg in clevo-drivers-dkms-git clevo-drivers-dkms tuxedo-drivers-dkms tuxedo-keyboard-dkms tuxedo-keyboard-ite-dkms; do
-    if pacman -Qq "${conflict_pkg}" >/dev/null 2>&1; then
+    if [[ "${installed_pkgs}" == *$'\n'"${conflict_pkg}"$'\n'* ]]; then
         pacman -Rdd --noconfirm "${conflict_pkg}"
     fi
 done
@@ -82,7 +85,7 @@ modprobe clevo_acpi || true
 modprobe clevo_wmi || true
 modprobe tuxedo_io || true
 
-if [[ "${TCCD_WAS_ACTIVE}" -eq 1 ]]; then
+if [[ "${TCCD_SHOULD_START}" -eq 1 ]]; then
     systemctl start tccd.service
 fi
 
