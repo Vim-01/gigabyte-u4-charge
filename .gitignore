@@ -1,0 +1,11 @@
+target/
+*.pkg.tar.zst
+src/
+pkg/
+tuxedo-drivers/
+*.o
+*.ko
+*.mod*
+.*.cmd
+Module.symvers
+modules.order

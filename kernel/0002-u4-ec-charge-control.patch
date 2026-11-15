@@ -1,0 +1,623 @@
+diff -Naur a/src/clevo_acpi.c b/src/clevo_acpi.c
+--- a/src/clevo_acpi.c	2026-11-15 02:34:32.336347381 +0500
++++ b/src/clevo_acpi.c	2026-11-15 02:34:32.338521133 +0500
+@@ -23,11 +23,15 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/acpi.h>
++#include <linux/delay.h>
++#include <linux/mutex.h>
+ #include <linux/version.h>
+ #include "clevo_interfaces.h"
+ 
+ #define DRIVER_NAME			"clevo_acpi"
+ 
++static DEFINE_MUTEX(clevo_acpi_ec_lock);
++
+ struct clevo_platform_driver_data_t {
+ 	struct acpi_device *adev;
+ 	struct clevo_interface_t *clevo_interface;
+@@ -44,11 +48,13 @@
+ 	union acpi_object *out_obj;
+ 	guid_t clevo_acpi_dsm_uuid;
+ 
+-	// Integer package data for argument
++	u32 arg_val = arg;
++	// Buffer package data for argument (required by DSDT CreateField)
+ 	union acpi_object dsm_argv4_package_data[] = {
+ 		{
+-			.integer.type = ACPI_TYPE_INTEGER,
+-			.integer.value = arg
++			.buffer.type = ACPI_TYPE_BUFFER,
++			.buffer.length = sizeof(arg_val),
++			.buffer.pointer = (u8 *)&arg_val
+ 		}
+ 	};
+ 
+@@ -132,14 +138,23 @@
+ {
+ 	int status = 0;
+ 
++	mutex_lock(&clevo_acpi_ec_lock);
+ 	if (!IS_ERR_OR_NULL(active_driver_data)) {
+ 		status = clevo_acpi_evaluate(active_driver_data->adev, cmd, arg, result_value);
++		/*
++		 * Hold the lock for 120ms after EC mailbox write commands (0x41, 0x76, 0x79)
++		 * so background pollers like tccd (calling 0x63/0x64 FCMD=0xC0) cannot overwrite
++		 * FDAT/FBUF/FBF1/FCMD before the ITE IT5570E EC processes the command.
++		 * Note: ACPI evaluation and AML PATM mutex are already released before msleep().
++		 */
++		if (cmd == 0x41 || cmd == 0x76 || cmd == 0x79)
++			msleep(120);
+ 	} else {
+ 		pr_err("acpi method call exec, no driver data found\n");
+ 		pr_err("..for method_call: %0#4x arg: %0#10x\n", cmd, arg);
+ 		status = -ENODATA;
+ 	}
+-	// pr_debug("clevo_acpi method_call: %0#4x arg: %0#10x result: %0#10x\n", cmd, arg, !IS_ERR_OR_NULL(result_value) ? *result_value : 0);
++	mutex_unlock(&clevo_acpi_ec_lock);
+ 
+ 	return status;
+ }
+@@ -148,6 +163,7 @@
+ {
+ 	int status = 0;
+ 
++	mutex_lock(&clevo_acpi_ec_lock);
+ 	if (!IS_ERR_OR_NULL(active_driver_data)) {
+ 		status = clevo_acpi_evaluate_pkgbuf(active_driver_data->adev, cmd, arg, length, result_value);
+ 	} else {
+@@ -155,6 +171,7 @@
+ 		pr_err("..for method_call: %0#2x\n", cmd);
+ 		status = -ENODATA;
+ 	}
++	mutex_unlock(&clevo_acpi_ec_lock);
+ 
+ 	return status;
+ }
+diff -Naur a/src/clevo_keyboard.h b/src/clevo_keyboard.h
+--- a/src/clevo_keyboard.h	2026-11-15 02:34:32.337399937 +0500
++++ b/src/clevo_keyboard.h	2026-11-15 02:34:32.339518383 +0500
+@@ -22,6 +22,9 @@
+ #define CLEVO_KEYBOARD_H
+ 
+ #include <linux/power_supply.h>
++#include <linux/delay.h>
++#include <linux/jiffies.h>
++#include <linux/mutex.h>
+ #include <acpi/battery.h>
+ #include <linux/version.h>
+ 
+@@ -459,52 +462,12 @@
+ }
+ 
+ static bool clevo_fn_lock_available(void){
+-	int err;
+-	union acpi_object *out_obj;
+-	u8 fnlock;
+-
+-	// no sysfs device for Aura Gen3 due to Fn Lock interference (via keyboard)
+-	// but Aura Gen3 refresh (NL45AU2 und NL57AU) has working Fn Lock
+-	if ((dmi_match(DMI_PRODUCT_SKU, "AURA14GEN3") ||
+-	     dmi_match(DMI_PRODUCT_SKU, "AURA15GEN3")) &&
+-	    (dmi_match(DMI_BOARD_NAME, "NL57PU") ||
+-	     dmi_match(DMI_BOARD_NAME, "NL45PU2")))
+-			return 0;
+-
+-	// check Fn lock for WMI
+-	if( strcmp(active_clevo_interface->string_id, CLEVO_INTERFACE_WMI_STRID) == 0) {
+-		pr_debug("FnLock test: WMI is not supported\n");
+-		return 0;
+-	}
+-
+-	// check Fn Lock for ACPI
+-	if( strcmp(active_clevo_interface->string_id, CLEVO_INTERFACE_ACPI_STRID) == 0) {
+-		err = clevo_evaluate_method2(0x4, 0x18, &out_obj);
+-		if (err) {
+-			pr_debug("FnLock test: ACPI evaluate returned an error\n");
+-			return 0;
+-		}
+-
+-		if (out_obj->type != ACPI_TYPE_BUFFER ) {
+-			pr_debug("FnLock test: no ACPI buffer\n");
+-			return 0;
+-		}
+-		if (out_obj->buffer.length < 3) {
+-			pr_debug("FnLock test: ACPI buffer too small\n");
+-			ACPI_FREE(out_obj);
+-			return 0;
+-		}
+-		fnlock = out_obj->buffer.pointer[0];
+-		if (fnlock != 1 && fnlock != 2) {
+-			pr_debug("FnLock test: unexpected FnLock value 0x%02x\n", fnlock);
+-			ACPI_FREE(out_obj);
+-			return 0;
+-		}
+-		ACPI_FREE(out_obj);
+-		return 1;
+-	}
+-
+-	return 0;
++	/*
++	 * DSDT _DSM Arg2 == 0x04 (PEVT) on CLV0001 has a BIOS AML bug (line 25167)
++	 * where Acquire(PATM) is missing Release(PATM) before Return(Local0), and
++	 * subcommand 0x18 does not exist on Legacy Clevo/Gigabyte U4 UD (RC14UD).
++	 */
++	return false;
+ }
+ 
+ static u8 clevo_legacy_flexicharger_start_values[] = {40, 50, 60, 70, 80, 95};
+@@ -530,13 +493,11 @@
+ static int clevo_has_legacy_flexicharger(bool *status)
+ {
+ 	u32 read_data = 0;
+-	u32 write_data = 0x06000000;
+ 	int result;
+ 
+ 	// Known exclude list
+ 	bool excluded_device = false
+ 		|| dmi_string_in(DMI_BOARD_NAME, "N24_25BU")
+-		|| dmi_string_in(DMI_BOARD_NAME, "L14xMU")
+ 		|| dmi_string_in(DMI_BOARD_NAME, "N141CU")
+ 		|| dmi_string_in(DMI_BOARD_NAME, "NH5xAx")
+ 		|| dmi_string_in(DMI_BOARD_NAME, "NL5xNU")
+@@ -554,88 +515,263 @@
+ 	}
+ 
+ 	// Use a combination of read and write read values to identify legacy flexicharger
+-	// Using set command should read the command back as result if existing
++	// Method 0x77 reads BAEE, BSCP, BTCP from ACPI
+ 	result = clevo_evaluate_method(0x77, 0, &read_data);
++	pr_info("clevo_has_legacy_flexicharger: method 0x77 returned result=%d, read_data=0x%08x\n", result, read_data);
++	if (result != 0) {
++		*status = false;
++		return result;
++	}
++
++	*status = true;
++	return 0;
++}
++
++static bool clevo_uses_atomic_baee_fc(void)
++{
++	return (dmi_string_in(DMI_SYS_VENDOR, "GIGABYTE") &&
++		(dmi_string_in(DMI_PRODUCT_NAME, "RC14UD") ||
++		 dmi_string_in(DMI_BOARD_NAME, "U4"))) ||
++	       dmi_string_in(DMI_BOARD_NAME, "L14xMU");
++}
++
++static DEFINE_MUTEX(clevo_legacy_fc_lock);
++static bool clevo_legacy_fc_initialized = false;
++static u8 clevo_legacy_fc_start = 40;
++static u8 clevo_legacy_fc_end = 100;
++static u8 clevo_legacy_fc_status = 0;
++
++static bool ec_live_cache_valid = false;
++static unsigned long ec_live_cache_expires = 0;
++static char ec_live_cache_buf[1024];
++
++/**
++ * Safely read 1 byte from EC RAM (0xFE0B0100 + offset) via ACPI ZEVT(0x6B) + ZEVT(0x73).
++ */
++static int clevo_ec_ram_read_u8(u8 offset, u8 *out_val)
++{
++	u32 dummy = 0;
++	u32 indx_arg = (u32)offset; /* size_shift = 0 (1 byte, proven working) */
++	union acpi_object *out_obj = NULL;
++	int err;
++
++	if (out_val == NULL)
++		return -EINVAL;
++
++	*out_val = 0;
++	err = clevo_evaluate_method(0x6B, indx_arg, &dummy);
++	if (err != 0)
++		return err;
++
++	err = clevo_evaluate_method2(0x73, 0, &out_obj);
++	if (err != 0 || out_obj == NULL)
++		return -EIO;
++
++	if (out_obj->type == ACPI_TYPE_BUFFER && out_obj->buffer.length >= 1 && out_obj->buffer.pointer != NULL) {
++		*out_val = out_obj->buffer.pointer[0];
++	} else if (out_obj->type == ACPI_TYPE_INTEGER) {
++		*out_val = (u8)(out_obj->integer.value & 0xFF);
++	} else {
++		ACPI_FREE(out_obj);
++		return -EIO;
++	}
++
++	ACPI_FREE(out_obj);
++	return 0;
++}
++
++static int clevo_ec_ram_read_u16(u8 offset, u32 *out_val)
++{
++	u8 lo = 0, hi = 0;
++	int err;
++
++	if (out_val == NULL)
++		return -EINVAL;
++	*out_val = 0;
++	err = clevo_ec_ram_read_u8(offset, &lo);
++	if (err != 0)
++		return err;
++	err = clevo_ec_ram_read_u8((u8)(offset + 1), &hi);
++	if (err != 0)
++		return err;
++	*out_val = (u32)lo | ((u32)hi << 8);
++	return 0;
++}
++
++static int clevo_legacy_flexicharger_ensure_init_locked(void)
++{
++	u32 data = 0;
++	int result;
++	u8 hw_start, hw_end, hw_status;
++
++	if (clevo_legacy_fc_initialized)
++		return 0;
++
++	/*
++	 * Method 0x77 reads static boot-time BIOS NVRAM snapshot (CONV: BAEE, BSCP, BTCP).
++	 * DSDT never updates BAEE/BSCP/BTCP at runtime when 0x76 writes to EC mailbox 0xCB,
++	 * so we initialize our shadow state once from 0x77 and maintain it across writes.
++	 */
++	result = clevo_evaluate_method(0x77, 0, &data);
+ 	if (result != 0)
+ 		return result;
+ 
+-	write_data |= ((read_data >> 8) & 0xffff);
+-	result = clevo_evaluate_method(0x76, write_data, &read_data);
++	hw_status = data & 0x01;
++	hw_start = (data >> 0x08) & 0xff;
++	hw_end = (data >> 0x10) & 0xff;
++
++	if (hw_start >= 40 && hw_start <= 95 &&
++	    hw_end >= 60 && hw_end <= 100 &&
++	    hw_start < hw_end) {
++		clevo_legacy_fc_start = hw_start;
++		clevo_legacy_fc_end = hw_end;
++		clevo_legacy_fc_status = hw_status;
++	} else {
++		clevo_legacy_fc_start = 40;
++		clevo_legacy_fc_end = 100;
++		clevo_legacy_fc_status = 0;
++	}
+ 
+-	if (read_data == 0x76)
+-		*status = true;
+-	else
+-		*status = false;
+-	
+-	return result;
++	clevo_legacy_fc_initialized = true;
++	return 0;
+ }
+ 
+ /**
+- * Read legacy flexicharger data. If successful parameter contains result.
+- * 
++ * Read legacy flexicharger data from kernel shadow state (initialized from 0x77).
++ *
+  * @param start Start threshold
+  * @param end End threshold
+  * @param status On or Off (1 or 0)
+  */
+ static int clevo_legacy_flexicharger_read(u8 *start, u8 *end, u8 *status)
+ {
+-	/*
+-	 * Data bytes
+-	 *            end      start    on/off
+-	 * |--------|--------|--------|--------|
+-	 */
+-	u32 data;
+ 	int result;
+ 
+-	result = clevo_evaluate_method(0x77, 0, &data);
+-	if (end != NULL)
+-		*end = (data >> 0x10) & 0xff;
+-	if (start != NULL)
+-		*start = (data >> 0x08) & 0xff;
+-	if (status != NULL)
+-		*status = data & 0x01;
++	mutex_lock(&clevo_legacy_fc_lock);
++	result = clevo_legacy_flexicharger_ensure_init_locked();
++	if (result == 0) {
++		if (end != NULL)
++			*end = clevo_legacy_fc_end;
++		if (start != NULL)
++			*start = clevo_legacy_fc_start;
++		if (status != NULL)
++			*status = clevo_legacy_fc_status;
++	}
++	mutex_unlock(&clevo_legacy_fc_lock);
+ 
+ 	return result;
+ }
+ 
+ /**
+- * Write flexicharger data.
+- * 
+- * @param start Start threshold
+- * @param end End threshold
+- * @param status On or Off (1 or 0)
++ * Write flexicharger data to EC.
++ * On Gigabyte U4/RC14UD (Clevo L14xMU EC IT5570E), ZEVT(0x76) Case 0x05 sets FBF1=0x01
++ * which firmware ignores; ZEVT(0x41) atomic 0xCB with FBF1=0x02 (Custom) / 0x00 (Standard)
++ * controls hardware thresholds reliably. Because EC latches into Not-charging when thresholds
++ * are raised without toggling FBF1=0x00 first, force_unlatch or threshold changes while active
++ * send 0x00CB -> 250ms soft-start gap (outside clevo_acpi_ec_lock) -> 0x02CB.
+  */
+-static int clevo_legacy_flexicharger_write(const u8 *param_start, const u8 *param_end, const u8 *param_status)
++static int clevo_legacy_flexicharger_write_opts(const u8 *param_start,
++						const u8 *param_end,
++						const u8 *param_status,
++						bool force_unlatch)
+ {
+-	// Two different subcommands for writing
+ 	u32 write_data_thresholds = (0x06 << 0x18);
+ 	u32 write_data_status = (0x05 << 0x18);
+-
+-	u8 previous_start, previous_end, previous_status;
++	u32 ret_acpi = 0;
+ 	u8 set_start, set_end, set_status;
++	bool need_unlatch = false;
++	int i;
+ 
+-	if (clevo_legacy_flexicharger_read(&previous_start, &previous_end, &previous_status) != 0)
++	mutex_lock(&clevo_legacy_fc_lock);
++	if (clevo_legacy_flexicharger_ensure_init_locked() != 0) {
++		mutex_unlock(&clevo_legacy_fc_lock);
+ 		return -EIO;
++	}
+ 
+-	// Set choosen parameters, leave nulled ones with previous value
+-	set_start = param_start != NULL ? *param_start : previous_start;
+-	set_end = param_end != NULL ? *param_end : previous_end;
+-	set_status = param_status != NULL ? *param_status : previous_status;
++	set_start = param_start != NULL ? *param_start : clevo_legacy_fc_start;
++	set_end = param_end != NULL ? *param_end : clevo_legacy_fc_end;
++	set_status = param_status != NULL ? *param_status : clevo_legacy_fc_status;
++
++	/* Ensure start < end invariant regardless of sysfs write order */
++	if (param_end != NULL && set_start >= set_end) {
++		set_start = clevo_legacy_flexicharger_start_values[0];
++		for (i = 0; i < ARRAY_SIZE(clevo_legacy_flexicharger_start_values); ++i) {
++			if (clevo_legacy_flexicharger_start_values[i] < set_end)
++				set_start = clevo_legacy_flexicharger_start_values[i];
++		}
++	} else if (param_start != NULL && set_start >= set_end) {
++		set_end = clevo_legacy_flexicharger_end_values[ARRAY_SIZE(clevo_legacy_flexicharger_end_values) - 1];
++		for (i = ARRAY_SIZE(clevo_legacy_flexicharger_end_values) - 1; i >= 0; --i) {
++			if (clevo_legacy_flexicharger_end_values[i] > set_start)
++				set_end = clevo_legacy_flexicharger_end_values[i];
++		}
++	}
+ 
+-	write_data_thresholds |= set_start;
+-	write_data_thresholds |= (set_end << 0x08);
+-	write_data_status |= set_status & 0x01;
++	/* Auto-enable Custom FlexiCharge when an end threshold < 100% is written */
++	if (param_status == NULL && param_end != NULL && set_end < 100)
++		set_status = 1;
++
++	if (clevo_uses_atomic_baee_fc()) {
++		if (set_status == 0) {
++			/* Proven autonomous resume via single ZEVT(0x41) FBF1=0x00 */
++			if (clevo_evaluate_method(0x41, 0x642800CB, &ret_acpi) != 0) {
++				mutex_unlock(&clevo_legacy_fc_lock);
++				return -EIO;
++			}
++		} else {
++			u32 atomic_arg = ((u32)set_end << 24)
++				       | ((u32)set_start << 16)
++				       | 0x02CB;
++			need_unlatch = force_unlatch ||
++				       (clevo_legacy_fc_status == 1 &&
++					(set_start != clevo_legacy_fc_start ||
++					 set_end != clevo_legacy_fc_end));
++			if (need_unlatch) {
++				if (clevo_evaluate_method(0x41, 0x642800CB, &ret_acpi) != 0) {
++					mutex_unlock(&clevo_legacy_fc_lock);
++					return -EIO;
++				}
++				/* Charger soft-start margin (>= 200-250ms) outside clevo_acpi_ec_lock */
++				msleep(250);
++			}
++			if (clevo_evaluate_method(0x41, atomic_arg, &ret_acpi) != 0) {
++				mutex_unlock(&clevo_legacy_fc_lock);
++				return -EIO;
++			}
++		}
++	} else {
++		write_data_thresholds |= set_start;
++		write_data_thresholds |= ((u32)set_end << 0x08);
++		write_data_status |= (set_status & 0x01);
++
++		if (clevo_evaluate_method(0x76, write_data_thresholds, &ret_acpi) != 0) {
++			mutex_unlock(&clevo_legacy_fc_lock);
++			return -EIO;
++		}
++		if (clevo_evaluate_method(0x76, write_data_status, &ret_acpi) != 0) {
++			mutex_unlock(&clevo_legacy_fc_lock);
++			return -EIO;
++		}
++	}
+ 
+-	// Write to EC, note that status go last as it also triggers save
+-	if (clevo_evaluate_method(0x76, write_data_thresholds, NULL) != 0)
+-		return -EIO;
++	clevo_legacy_fc_start = set_start;
++	clevo_legacy_fc_end = set_end;
++	clevo_legacy_fc_status = set_status & 0x01;
++	ec_live_cache_valid = false;
++
++	pr_info("flexicharger updated (%s): start=%u%% end=%u%% status=%u (acpi_ret=0x%08x)\n",
++		clevo_uses_atomic_baee_fc() ? "atomic-0x41-baee" : "legacy-0x76",
++		clevo_legacy_fc_start, clevo_legacy_fc_end, clevo_legacy_fc_status, ret_acpi);
+ 
+-	if (clevo_evaluate_method(0x76, write_data_status, NULL) != 0)
+-		return -EIO;
+-	
++	mutex_unlock(&clevo_legacy_fc_lock);
+ 	return 0;
+ }
+ 
++static int clevo_legacy_flexicharger_write(const u8 *param_start, const u8 *param_end, const u8 *param_status)
++{
++	return clevo_legacy_flexicharger_write_opts(param_start, param_end, param_status, false);
++}
++
+ static int clevo_cc4_flexicharger_read(u8 *start, u8 *end, u8 *status)
+ {
+ 	int result;
+@@ -671,11 +807,12 @@
+ 
+ static int clevo_has_cc4_flexicharger(bool *status)
+ {
+-	if (clevo_cc4_flexicharger_read(NULL, NULL, NULL))
+-		*status = false;
+-	else
+-		*status = true;
+-
++	/*
++	 * DSDT _DSM Arg2 == 0x04 (PEVT) on CLV0001 has a BIOS AML bug (line 25167)
++	 * where Acquire(PATM) is missing Release(PATM), and CC4 subcommand 0x1E
++	 * does not exist on Legacy Clevo/Gigabyte U4 UD (RC14UD).
++	 */
++	*status = false;
+ 	return 0;
+ }
+ 
+@@ -1006,12 +1143,112 @@
+ 	clevo_flexicharger_init();
+ }
+ 
++static ssize_t ec_live_state_show(struct device *device,
++				  struct device_attribute *attr,
++				  char *buf)
++{
++	u8 adp_raw = 0, bst0 = 0, brs0 = 0, ea_raw = 0;
++	u8 fcmd = 0, fdat = 0, fbuf = 0, fbf1 = 0, fbf2 = 0;
++	u32 bfc0 = 0, bpr0 = 0, brc0 = 0, bpv0 = 0;
++	u32 bios77 = 0;
++	u32 current_ma = 0;
++	int is_discharging = 0, is_charging = 0;
++
++	mutex_lock(&clevo_legacy_fc_lock);
++	if (ec_live_cache_valid && time_before(jiffies, ec_live_cache_expires)) {
++		ssize_t cached_len = sysfs_emit(buf, "%s", ec_live_cache_buf);
++		mutex_unlock(&clevo_legacy_fc_lock);
++		return cached_len;
++	}
++
++	clevo_ec_ram_read_u8(0x10, &adp_raw);
++	clevo_ec_ram_read_u16(0x1A, &bfc0);
++	clevo_ec_ram_read_u8(0x26, &bst0);
++	clevo_ec_ram_read_u16(0x2A, &bpr0);
++	clevo_ec_ram_read_u16(0x2E, &brc0);
++	clevo_ec_ram_read_u16(0x32, &bpv0);
++	clevo_ec_ram_read_u8(0x38, &brs0);
++	clevo_ec_ram_read_u8(0xEA, &ea_raw);
++	clevo_ec_ram_read_u8(0xF8, &fcmd);
++	clevo_ec_ram_read_u8(0xF9, &fdat);
++	clevo_ec_ram_read_u8(0xFA, &fbuf);
++	clevo_ec_ram_read_u8(0xFB, &fbf1);
++	clevo_ec_ram_read_u8(0xFC, &fbf2);
++	clevo_evaluate_method(0x77, 0, &bios77);
++
++	current_ma = bpr0 & 0xFFFF;
++	if (current_ma & 0x8000)
++		current_ma = (current_ma ^ 0xFFFF) & 0xFFFF;
++
++	is_discharging = (bst0 & 0x01) ? 1 : 0;
++	is_charging = (bst0 & 0x02) ? 1 : 0;
++
++	scnprintf(ec_live_cache_buf, sizeof(ec_live_cache_buf),
++		"EC_ADP=%u\n"
++		"EC_BAT0_PRESENT=%u\n"
++		"EC_BST0_HEX=0x%02x\n"
++		"EC_CHARGING_BIT=%d\n"
++		"EC_DISCHARGING_BIT=%d\n"
++		"EC_BPR0_RAW_HEX=0x%04x\n"
++		"EC_CURRENT_MA=%u\n"
++		"EC_BRC0_MAH=%u\n"
++		"EC_BFC0_MAH=%u\n"
++		"EC_BPV0_MV=%u\n"
++		"EC_BRS0_PCT=%u\n"
++		"EC_EA_HEX=0x%02x\n"
++		"EC_RCHG=%u\n"
++		"EC_ACOT=%u\n"
++		"EC_FBOX_HEX=0x%02x_%02x_%02x_%02x_%02x\n"
++		"BIOS_0x77_HEX=0x%08x\n"
++		"FC_METHOD=%s\n"
++		"SHADOW_START=%u\n"
++		"SHADOW_END=%u\n"
++		"SHADOW_STATUS=%u\n",
++		(adp_raw & 0x01) ? 1U : 0U,
++		(adp_raw & 0x04) ? 1U : 0U,
++		bst0 & 0xFF,
++		is_charging,
++		is_discharging,
++		bpr0 & 0xFFFF,
++		current_ma,
++		brc0 & 0xFFFF,
++		bfc0 & 0xFFFF,
++		bpv0 & 0xFFFF,
++		brs0 & 0xFF,
++		ea_raw & 0xFF,
++		(ea_raw & 0x20) ? 1U : 0U,
++		(ea_raw & 0x40) ? 1U : 0U,
++		fcmd & 0xFF,
++		fdat & 0xFF,
++		fbuf & 0xFF,
++		fbf1 & 0xFF,
++		fbf2 & 0xFF,
++		bios77,
++		clevo_uses_atomic_baee_fc() ? "atomic-0x41-baee" : "legacy-0x76",
++		clevo_legacy_fc_start,
++		clevo_legacy_fc_end,
++		clevo_legacy_fc_status);
++
++	ec_live_cache_expires = jiffies + msecs_to_jiffies(500);
++	ec_live_cache_valid = true;
++
++	{
++		ssize_t out_len = sysfs_emit(buf, "%s", ec_live_cache_buf);
++		mutex_unlock(&clevo_legacy_fc_lock);
++		return out_len;
++	}
++}
++
++static DEVICE_ATTR_RO(ec_live_state);
++
+ static int clevo_keyboard_probe(struct platform_device *dev)
+ {
+ 	clevo_leds_init(dev);
+ 	// clevo_keyboard_init_device_interface() must come after clevo_leds_init()
+ 	// to know keyboard backlight type
+ 	clevo_keyboard_init_device_interface(dev);
++	if (device_create_file(&dev->dev, &dev_attr_ec_live_state) != 0)
++		TUXEDO_ERROR("Failed to create ec_live_state sysfs file\n");
+ 	clevo_keyboard_init();
+ 
+ 	return 0;
+@@ -1019,6 +1256,7 @@
+ 
+ static void clevo_keyboard_remove_device_interface(struct platform_device *dev)
+ {
++	device_remove_file(&dev->dev, &dev_attr_ec_live_state);
+ 	if (kbd_led_state.has_mode == 1) {
+ 		device_remove_file(&dev->dev, &dev_attr_kbd_backlight_mode);
+ 	}
+@@ -1050,6 +1288,9 @@
+ 	clevo_leds_restore_state_extern(); // Sometimes clevo devices forget their last state after
+ 					   // suspend, so let the kernel ensure it.
+ 	clevo_leds_resume(dev);
++	if (charge_control_registered) {
++		clevo_legacy_flexicharger_write_opts(NULL, NULL, NULL, true);
++	}
+ 	return 0;
+ }
+ 

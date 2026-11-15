@@ -1,0 +1,36 @@
+[Unit]
+Description=Gigabyte U4 / Clevo L14xMU Battery Charge Limit Daemon
+After=systemd-modules-load.service local-fs.target
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/u4-charge daemon
+Restart=on-failure
+RestartSec=5
+User=root
+Group=wheel
+UMask=0027
+RuntimeDirectory=u4-charge
+RuntimeDirectoryMode=0750
+StateDirectory=u4-charge
+StateDirectoryMode=0700
+
+# Systemd sandboxing compatible with /sys/class/power_supply/BAT0 writes & /run/u4-charge/control.sock
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

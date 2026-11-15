@@ -1,0 +1,12 @@
+[Unit]
+Description=U4 Charge Interactive KDE Notification
+After=graphical-session.target plasma-plasmashell.service
+PartOf=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+ExecStart=/usr/local/bin/u4-charge notify
+
+[Install]
+WantedBy=graphical-session.target

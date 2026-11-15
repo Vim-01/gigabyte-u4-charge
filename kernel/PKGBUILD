@@ -1,0 +1,66 @@
+# Maintainer: vim2 (GIGABYTE U4 UD / RC14UD / Clevo L14xMU)
+_pkgname=clevo-drivers-u4
+pkgname=${_pkgname}-dkms
+pkgver=4.25.0
+pkgrel=1
+pkgdesc="Gigabyte U4 UD (RC14UD / Clevo L14xMU) patched clevo/tuxedo drivers with atomic ZEVT(0x41) charge thresholds (DKMS)"
+arch=('x86_64')
+url="https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers"
+license=('GPL-2.0-or-later')
+depends=('dkms')
+makedepends=('git')
+optdepends=(
+  'linux-headers: build modules against Arch kernel'
+  'linux-lts-headers: build modules against LTS kernel'
+  'linux-zen-headers: build modules against ZEN kernel'
+  'linux-hardened-headers: build modules against HARDENED kernel'
+)
+provides=(
+  'tuxedo-drivers-dkms'
+  'tuxedo-keyboard'
+  'tuxedo-keyboard-ite'
+  'tuxedo-io'
+  'clevo-wmi'
+  'clevo-acpi'
+  'uniwill-wmi'
+  'ite_8291'
+  'ite_8291_lb'
+  'ite_8297'
+  'ite_829x'
+  'clevo-drivers-dkms'
+  'clevo-drivers-dkms-git'
+)
+conflicts=(
+  'clevo-drivers-dkms'
+  'clevo-drivers-dkms-git'
+  'tuxedo-drivers-dkms'
+  'tuxedo-keyboard-dkms'
+  'tuxedo-keyboard-ite-dkms'
+)
+source=(
+  "tuxedo-drivers::git+https://gitlab.com/tuxedocomputers/development/packages/tuxedo-drivers.git#tag=v${pkgver}"
+  'dkms.conf'
+  '0001-tuxedo-compatibility-check.patch'
+  '0002-u4-ec-charge-control.patch'
+)
+sha256sums=(
+  'SKIP'
+  'e7f18a5361118c07b95f2800848c00e98c37b3833b51d76329f0c519ba2964bf'
+  'd6bef54bcf39e5aa24b3f1148c4ffc65dd054a23ca3af44787a7d1010169b6b6'
+  'f38f1efd2f3f33834ee48a78375a08ab7dc47d0bd09fb8a913b4de15033110e0'
+)
+
+prepare() {
+  cd "${srcdir}/tuxedo-drivers"
+  patch -Np1 -i "${srcdir}/0001-tuxedo-compatibility-check.patch"
+  patch -Np1 -i "${srcdir}/0002-u4-ec-charge-control.patch"
+}
+
+package() {
+  install -dm755 "${pkgdir}/usr/src/${_pkgname}-${pkgver}"
+  cp -a --no-preserve=ownership "${srcdir}/tuxedo-drivers/src/." "${pkgdir}/usr/src/${_pkgname}-${pkgver}/"
+  install -Dm644 "${srcdir}/dkms.conf" "${pkgdir}/usr/src/${_pkgname}-${pkgver}/dkms.conf"
+  sed -e "s/#MODULE_VERSION#/${pkgver}/g" -i "${pkgdir}/usr/src/${_pkgname}-${pkgver}/dkms.conf"
+
+  cp -a --no-preserve=ownership "${srcdir}/tuxedo-drivers/files/usr" "${pkgdir}/"
+}
